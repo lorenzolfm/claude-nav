@@ -1,0 +1,16 @@
+[package]
+name = "claude-nav"
+version = "0.1.0"
+edition = "2024"
+description = "How Claude Code agents read, and how you get to one"
+license = "MIT"
+repository = "https://github.com/lorenzolfm/claude-nav"
+
+[dependencies]
+# The producer sends JSON. A deserialisation by name keeps a new key from a break
+# of compatibility, which an appended column caused.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
