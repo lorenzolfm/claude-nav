@@ -5,7 +5,7 @@
 //! nothing, which is the point: the launcher extension and the tray applet show
 //! the same agent in the same place with the same word.
 
-use claude_nav::agents;
+use claude_nav::agents::{self, Row, Zellij};
 use claude_nav::jump;
 use claude_nav::state::{self, Snapshot, Target};
 use serde::Serialize;
@@ -22,6 +22,7 @@ claude-nav — how Claude Code agents read, and how you get to one.
   claude-nav jump <session> <pane>
       Move the focus to that zellij pane, raising or retargeting the terminal
       that shows it and opening one only if there is none. Silent on success.
+      Exits non-zero if no live agent holds that pane.
 
 The `status` of a row is what Claude Code reports, verbatim, and its vocabulary
 is open. `state` is this program's closed reading of it — waiting, idle, busy or
@@ -156,10 +157,39 @@ fn leap(session: &str, pane: &str) -> ExitCode {
         return fail(&format!("{session}:{pane} is not an address"));
     }
 
+    // The library's contract is that the address names a live agent, and the
+    // tray applet satisfies it by construction: a menu row carries the address
+    // of the snapshot it was drawn from, and the menu is rebuilt as it opens.
+    //
+    // A command line satisfies nothing, and a launcher's list can be a second
+    // old when `Enter` reaches it. Without this check an agent that has exited
+    // since the list was drawn falls through to `attach`, which *creates* a
+    // session under that name and returns success — the same failure that the
+    // whitespace rule above exists to prevent, reached by a different door. The
+    // jump would report that it landed, and it would have invented the place.
+    match agents::poll() {
+        Ok(rows) if !holds(&rows, session, pane) => {
+            return fail(&format!("no agent at {session}:{pane}"));
+        }
+        Err(e) => return fail(&e.to_string()),
+        Ok(_) => {}
+    }
+
     match jump::focus(&target) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e),
     }
+}
+
+/// Whether a live agent holds that pane.
+///
+/// The comparison is against the address a row would have been *shown* with, so
+/// an address `list` refused is one `jump` refuses too. Two doors, one answer.
+fn holds(rows: &[Row], session: &str, pane: &str) -> bool {
+    rows.iter()
+        .filter_map(|row| row.zellij.as_ref())
+        .filter_map(Zellij::address)
+        .any(|z| z.session == session && z.pane == pane)
 }
 
 fn fail(why: &str) -> ExitCode {
@@ -172,4 +202,59 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(session: &str, pane: &str) -> Row {
+        Row {
+            raw_status: "idle".into(),
+            transition_age_s: 5,
+            zellij: Some(Zellij {
+                session: session.into(),
+                pane: pane.into(),
+            }),
+            name: "n".into(),
+            name_source: None,
+        }
+    }
+
+    #[test]
+    fn a_live_pane_is_held() {
+        let rows = [row("infra", "0"), row("dotfiles", "3")];
+        assert!(holds(&rows, "infra", "0"));
+        assert!(holds(&rows, "dotfiles", "3"));
+    }
+
+    #[test]
+    fn a_session_that_is_gone_holds_nothing() {
+        assert!(!holds(&[row("infra", "0")], "nosuchsession", "0"));
+        assert!(!holds(&[], "infra", "0"));
+    }
+
+    #[test]
+    fn the_pane_has_to_match_too() {
+        assert!(!holds(&[row("infra", "0")], "infra", "3"));
+    }
+
+    #[test]
+    fn an_agent_outside_zellij_holds_nothing() {
+        let mut outside = row("infra", "0");
+        outside.zellij = None;
+        assert!(!holds(&[outside], "infra", "0"));
+    }
+
+    #[test]
+    fn an_address_the_listing_refused_is_refused_here() {
+        // `list` shows a null target for these, so `jump` must not act on them
+        // either: one of the two would otherwise invent a session by attaching.
+        for (session, pane) in [("my work", "0"), ("", "0"), ("infra", "")] {
+            assert!(
+                !holds(&[row(session, pane)], session, pane),
+                "{session}:{pane}"
+            );
+        }
+    }
 }
