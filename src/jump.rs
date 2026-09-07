@@ -24,8 +24,15 @@ struct Terminal {
     window: u32,
 }
 
-pub fn focus(target: &Target) -> Result<(), String> {
-    let terminals = terminals()?;
+pub fn focus(want: &Target) -> Result<(), String> {
+    let sockets = server_sockets(&sessions()?);
+    let target = &Target {
+        session: answers_to(&want.session, &sockets)
+            .ok_or_else(|| format!("no live session named {}", want.session))?,
+        pane: want.pane.clone(),
+    };
+
+    let terminals = terminals(&sockets)?;
 
     if let Some(t) = terminals.iter().find(|t| t.session == target.session) {
         focus_pane(target)?;
@@ -34,19 +41,41 @@ pub fn focus(target: &Target) -> Result<(), String> {
         }
     }
 
-    if let Some(t) = terminals.iter().find(|t| t.session != target.session)
-        && retarget(t, target)?
-        && raise(t.window)?
-    {
-        return Ok(());
-    }
+    // The window in front of the person is the one to move; any other terminal
+    // will do when the focus is somewhere else entirely.
+    let elsewhere = terminals.iter().filter(|t| t.session != target.session);
+    let focused = focused();
+    let chosen = elsewhere
+        .clone()
+        .find(|t| Some(t.window) == focused)
+        .or_else(|| elsewhere.clone().next());
 
-    attach(&target.session)
+    // A terminal that is already showing zellij is the answer, and saying so
+    // when moving it fails beats opening a second window over the first.
+    match chosen {
+        Some(t) => retarget(t, target, &sockets),
+        None => attach(&target.session),
+    }
 }
 
-fn terminals() -> Result<Vec<Terminal>, String> {
+/// The name a session answers to, for a caller that may hold an older one.
+///
+/// A surface reads the session out of a pane's environment, which keeps the
+/// name the pane was born with. Renaming the session leaves that address one
+/// zellij no longer knows, and refusing it would strand the agent behind it.
+fn answers_to(session: &str, sockets: &HashMap<String, String>) -> Option<String> {
+    if sockets.values().any(|live| live == session) {
+        return Some(session.to_string());
+    }
+    sockets
+        .iter()
+        .find(|(path, _)| path.rsplit('/').next() == Some(session))
+        .map(|(_, live)| live.clone())
+}
+
+fn terminals(sockets: &HashMap<String, String>) -> Result<Vec<Terminal>, String> {
     let windows = window_pids()?;
-    let live = live_sessions()?;
+    let live = live_sessions(sockets)?;
     Ok(client_pids()
         .into_iter()
         .filter_map(|client| {
@@ -58,6 +87,37 @@ fn terminals() -> Result<Vec<Terminal>, String> {
         })
         .collect())
 }
+
+/// Every live session, by the name zellij answers to today.
+fn sessions() -> Result<Vec<String>, String> {
+    let out = zellij()
+        .args(["list-sessions", "--short"])
+        .output()
+        .map_err(|e| format!("zellij: {e}"))?;
+
+    // A desktop with no session at all is an exit code, not a failure.
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(parse_sessions(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_sessions(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The pid of the focused window.
+fn focused() -> Option<u32> {
+    let out = hyprctl().arg("repl").arg(FOCUSED_LUA).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+const FOCUSED_LUA: &str =
+    "local w = hl.get_active_window() if w then return tostring(w.pid) end return \"none\"";
 
 fn focus_pane(target: &Target) -> Result<(), String> {
     let out = zellij()
@@ -75,11 +135,12 @@ fn focus_pane(target: &Target) -> Result<(), String> {
     .map_err(|why| format!("focus {}:{} failed: {why}", target.session, target.pane))
 }
 
-fn pane_outcome(ok: bool, stdout: &str, stderr: &str) -> Result<(), String> {
+/// What a `zellij action` really did.
+///
+/// zellij answers an address it cannot find on stdout and still exits 0, so the
+/// status alone cannot tell a silent no-op from the move that was asked for.
+fn action_outcome(ok: bool, stdout: &str, stderr: &str) -> Result<(), String> {
     if ok && stdout.is_empty() && stderr.is_empty() {
-        return Ok(());
-    }
-    if stderr.contains("is already focused") {
         return Ok(());
     }
     let why = [stderr, stdout]
@@ -90,12 +151,32 @@ fn pane_outcome(ok: bool, stdout: &str, stderr: &str) -> Result<(), String> {
     Err(why.to_string())
 }
 
-fn retarget(from: &Terminal, target: &Target) -> Result<bool, String> {
+fn pane_outcome(ok: bool, stdout: &str, stderr: &str) -> Result<(), String> {
+    if stderr.contains("is already focused") {
+        return Ok(());
+    }
+    action_outcome(ok, stdout, stderr)
+}
+
+fn retarget(
+    from: &Terminal,
+    target: &Target,
+    sockets: &HashMap<String, String>,
+) -> Result<(), String> {
     if !raise(from.window)? {
-        return Ok(false);
+        return Err(format!("the window showing {} is gone", from.session));
     }
     wake(from.window)?;
-    switch(from, target)
+    switch(from, target)?;
+    if arrived(from.client, &target.session, sockets) {
+        return Ok(());
+    }
+    Err(format!(
+        "{} did not reach {} within {}ms",
+        from.session,
+        target.session,
+        SWITCH_DEADLINE.as_millis()
+    ))
 }
 
 fn wake(window: u32) -> Result<(), String> {
@@ -121,7 +202,7 @@ fn wake_lua(window: u32) -> String {
     )
 }
 
-fn switch(from: &Terminal, target: &Target) -> Result<bool, String> {
+fn switch(from: &Terminal, target: &Target) -> Result<(), String> {
     let out = zellij()
         .args(["--session", &from.session, "action", "switch-session"])
         .arg("--pane-id")
@@ -130,22 +211,24 @@ fn switch(from: &Terminal, target: &Target) -> Result<bool, String> {
         .output()
         .map_err(|e| format!("zellij: {e}"))?;
 
-    if !out.status.success() {
-        let noise = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "switch {} -> {} failed: {}",
-            from.session,
-            target.session,
-            first_line(&noise).unwrap_or("zellij said nothing")
-        ));
-    }
-    Ok(arrived(from.client, &target.session))
+    let noise = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    action_outcome(
+        out.status.success(),
+        &noise(&out.stdout),
+        &noise(&out.stderr),
+    )
+    .map_err(|why| {
+        format!(
+            "switch {} -> {} failed: {why}",
+            from.session, target.session
+        )
+    })
 }
 
-fn arrived(client: u32, session: &str) -> bool {
+fn arrived(client: u32, session: &str, sockets: &HashMap<String, String>) -> bool {
     let deadline = Instant::now() + SWITCH_DEADLINE;
     loop {
-        if live_sessions()
+        if live_sessions(sockets)
             .ok()
             .and_then(|live| live.get(&client).cloned())
             .is_some_and(|s| s == session)
@@ -231,15 +314,12 @@ fn ancestry(pid: u32) -> Vec<u32> {
     chain
 }
 
-fn live_sessions() -> Result<HashMap<u32, String>, String> {
+fn live_sessions(sockets: &HashMap<String, String>) -> Result<HashMap<u32, String>, String> {
     let out = Command::new("ss")
         .args(["-x", "-p"])
         .output()
         .map_err(|e| format!("ss: {e}"))?;
-    Ok(pair_sockets(
-        &String::from_utf8_lossy(&out.stdout),
-        &server_sockets(),
-    ))
+    Ok(pair_sockets(&String::from_utf8_lossy(&out.stdout), sockets))
 }
 
 fn pair_sockets(ss: &str, servers: &HashMap<String, String>) -> HashMap<u32, String> {
@@ -276,14 +356,42 @@ fn pid_in(users: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
-fn server_sockets() -> HashMap<String, String> {
-    proc_argvs()
-        .filter_map(|argv| {
-            let path = server_socket(&argv)?;
-            let session = path.rsplit('/').next()?.to_string();
-            Some((path.to_string(), session))
-        })
-        .collect()
+/// Every zellij server, as `socket path -> session name`.
+///
+/// A server's argv holds the name its session was started with; `live_names`
+/// holds the name it answers to now. Renaming a session parts the two, and only
+/// the second one can address it.
+fn server_sockets(live_names: &[String]) -> HashMap<String, String> {
+    let paths: Vec<String> = proc_argvs()
+        .filter_map(|argv| Some(server_socket(&argv)?.to_string()))
+        .collect();
+    name_sockets(&paths, live_names)
+}
+
+fn name_sockets(paths: &[String], live_names: &[String]) -> HashMap<String, String> {
+    let named = |path: &str| path.rsplit('/').next().unwrap_or_default().to_string();
+
+    let (live, renamed): (Vec<&String>, Vec<&String>) = paths
+        .iter()
+        .partition(|path| live_names.contains(&named(path)));
+
+    let mut sockets: HashMap<String, String> = live
+        .iter()
+        .map(|path| (path.to_string(), named(path)))
+        .collect();
+
+    // One server that no longer answers to the name it was started with, and
+    // one live name no server claims, are the two halves of one rename. More
+    // than one of either is an ambiguity to leave alone rather than guess at.
+    let mut unclaimed = live_names
+        .iter()
+        .filter(|name| !sockets.values().any(|claimed| claimed == *name));
+    if let ([path], Some(name)) = (renamed.as_slice(), unclaimed.next())
+        && unclaimed.next().is_none()
+    {
+        sockets.insert(path.to_string(), name.clone());
+    }
+    sockets
 }
 
 fn server_socket(argv: &[String]) -> Option<&str> {
@@ -450,6 +558,93 @@ mod tests {
         ] {
             assert!(is_client(&a), "{a:?}");
         }
+    }
+
+    #[test]
+    fn a_session_zellij_cannot_find_is_failure() {
+        // The whole reason `switch` reads the output: this exits 0.
+        let e = action_outcome(true, "Session 'infra' not found. The following", "").unwrap_err();
+        assert!(e.contains("not found"), "{e}");
+    }
+
+    #[test]
+    fn sessions_are_one_name_per_line() {
+        assert_eq!(
+            parse_sessions("infra\ndotfiles\n\n"),
+            args(&["infra", "dotfiles"])
+        );
+        assert!(parse_sessions("").is_empty());
+    }
+
+    fn socket(name: &str) -> String {
+        format!("/run/user/1000/zellij/contract_version_1/{name}")
+    }
+
+    #[test]
+    fn a_server_is_named_by_the_name_its_session_answers_to() {
+        let paths = [socket("infra"), socket("dotfiles")];
+        let named = name_sockets(&paths, &args(&["infra", "dotfiles"]));
+        assert_eq!(
+            named.get(&socket("infra")).map(String::as_str),
+            Some("infra")
+        );
+        assert_eq!(
+            named.get(&socket("dotfiles")).map(String::as_str),
+            Some("dotfiles")
+        );
+    }
+
+    #[test]
+    fn a_renamed_session_is_named_by_the_name_it_answers_to_now() {
+        // The argv keeps the old path forever; the rename shows up as a live
+        // name no server claims.
+        let paths = [socket("antidore"), socket("infra")];
+        let named = name_sockets(&paths, &args(&["antidote", "infra"]));
+        assert_eq!(
+            named.get(&socket("antidore")).map(String::as_str),
+            Some("antidote")
+        );
+    }
+
+    #[test]
+    fn two_renames_at_once_are_left_alone() {
+        let paths = [socket("a"), socket("b")];
+        let named = name_sockets(&paths, &args(&["c", "d"]));
+        assert!(named.is_empty(), "{named:?}");
+    }
+
+    #[test]
+    fn a_server_whose_session_is_gone_names_nothing() {
+        let paths = [socket("infra"), socket("dead")];
+        let named = name_sockets(&paths, &args(&["infra"]));
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(
+            named.get(&socket("infra")).map(String::as_str),
+            Some("infra")
+        );
+    }
+
+    #[test]
+    fn a_name_a_session_still_answers_to_is_kept() {
+        let named = name_sockets(&[socket("infra")], &args(&["infra"]));
+        assert_eq!(answers_to("infra", &named).as_deref(), Some("infra"));
+        assert_eq!(answers_to("gone", &named), None);
+    }
+
+    #[test]
+    fn an_address_from_before_a_rename_still_reaches_the_session() {
+        let named = name_sockets(&[socket("antidore")], &args(&["antidote"]));
+        assert_eq!(answers_to("antidore", &named).as_deref(), Some("antidote"));
+        assert_eq!(answers_to("antidote", &named).as_deref(), Some("antidote"));
+    }
+
+    #[test]
+    fn focused_lua_answers_a_pid_or_none() {
+        assert!(
+            FOCUSED_LUA.contains("hl.get_active_window()"),
+            "{FOCUSED_LUA}"
+        );
+        assert!(FOCUSED_LUA.ends_with("return \"none\""), "{FOCUSED_LUA}");
     }
 
     #[test]
